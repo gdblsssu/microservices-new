@@ -1,15 +1,16 @@
 package com.example.orderservice.service;
 
+import brave.Span;
+import brave.Tracer;
 import com.example.orderservice.dto.InventoryResponse;
 import com.example.orderservice.dto.OrderLineItemsDto;
 import com.example.orderservice.dto.OrderRequest;
 import com.example.orderservice.model.Order;
 import com.example.orderservice.model.OrderLineItems;
 import com.example.orderservice.repository.OrderRepository;
-import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.util.Arrays;
@@ -19,43 +20,54 @@ import java.util.UUID;
 @Service
 @RequiredArgsConstructor
 @Transactional
-@Slf4j
 public class OrderService {
 
     private final OrderRepository orderRepository;
     private final WebClient.Builder webClientBuilder;
+    private final Tracer tracer;
 
     public String placeOrder(OrderRequest orderRequest) {
         Order order = new Order();
         order.setOrderNumber(UUID.randomUUID().toString());
 
-        List<OrderLineItems> orderLineItemsList = orderRequest.getOrderLineItemsDtoList()
+        List<OrderLineItems> orderLineItems = orderRequest.getOrderLineItemsDtoList()
                 .stream()
                 .map(this::mapToDto)
                 .toList();
 
-        order.setOrderLineItemsList(orderLineItemsList);
+        order.setOrderLineItemsList(orderLineItems);
 
         List<String> skuCodes = order.getOrderLineItemsList().stream()
                 .map(OrderLineItems::getSkuCode)
                 .toList();
 
-        InventoryResponse[] inventoryResponsesArr = webClientBuilder.build().get()
-                .uri("http://inventory-service/api/inventory",
-                        uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build())
-                .retrieve()
-                .bodyToMono(InventoryResponse[].class)
-                .block();
+        Span inventoryServiceLookup = tracer.nextSpan().name("InventoryServiceLookup");
 
-        boolean allProductsInStock = Arrays.stream(inventoryResponsesArr)
-                .allMatch(InventoryResponse::isInStock);
+        try (Tracer.SpanInScope isLookup = tracer.withSpanInScope(inventoryServiceLookup.start())) {
 
-        if(allProductsInStock){
-            orderRepository.save(order);
-            return "Order complete";
+            inventoryServiceLookup.tag("call", "inventory-service");
+
+            // Call Inventory Service, and place order if product is in
+            // stock
+            InventoryResponse[] inventoryResponsArray = webClientBuilder.build().get()
+                    .uri("http://inventory-service/api/inventory",
+                            uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build())
+                    .retrieve()
+                    .bodyToMono(InventoryResponse[].class)
+                    .block();
+
+            boolean allProductsInStock = Arrays.stream(inventoryResponsArray)
+                    .allMatch(InventoryResponse::isInStock);
+
+            if(allProductsInStock){
+                orderRepository.save(order);
+                return "Order Placed Successfully";
+            } else {
+                throw new IllegalArgumentException("Product is not in stock, please try again later");
+            }
+        } finally {
+            inventoryServiceLookup.flush();
         }
-        else
-            throw new IllegalArgumentException("Product is not in stock");
     }
 
     private OrderLineItems mapToDto(OrderLineItemsDto orderLineItemsDto) {
